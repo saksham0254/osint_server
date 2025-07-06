@@ -1259,6 +1259,10 @@ class PerpetualAgent:
         
         while self.running:
             try:
+                # Check if we should stop before starting a new run
+                if not self.running:
+                    break
+                    
                 # Generate new keyword for this run
                 keyword = self.get_next_keyword()
                 logger.info(f"Starting agent run #{self.total_runs + 1} with keyword: {keyword}")
@@ -1274,8 +1278,11 @@ class PerpetualAgent:
                 logger.info(f"Agent run #{self.total_runs} completed in {duration:.2f}s")
                 logger.info(f"Waiting {self.delay_seconds}s before next run...")
                 
-                # Wait before next run
-                time.sleep(self.delay_seconds)
+                # Wait before next run, but check running flag frequently
+                for _ in range(self.delay_seconds):
+                    if not self.running:
+                        break
+                    time.sleep(1)
                 
             except KeyboardInterrupt:
                 logger.info("Received interrupt signal, stopping perpetual agent...")
@@ -1284,7 +1291,11 @@ class PerpetualAgent:
             except Exception as e:
                 logger.error(f"Error in perpetual agent run: {e}")
                 logger.info(f"Waiting {self.delay_seconds}s before retry...")
-                time.sleep(self.delay_seconds)
+                # Wait before retry, but check running flag frequently
+                for _ in range(self.delay_seconds):
+                    if not self.running:
+                        break
+                    time.sleep(1)
     
     def stop(self):
         """Stop the perpetual agent process."""

@@ -241,11 +241,28 @@ async def shutdown_event():
     
     logger.info("Starting shutdown...")
     
-    # Quick shutdown - don't wait for anything
+    # Stop the perpetual agent first and wait for it
     try:
         if perpetual_agent_instance and perpetual_agent_instance.running:
             logger.info("Stopping perpetual agent...")
             perpetual_agent_instance.stop()
+            
+            # Wait for the agent thread to finish
+            if perpetual_agent_thread and perpetual_agent_thread.is_alive():
+                logger.info("Waiting for perpetual agent thread to finish...")
+                perpetual_agent_thread.join(timeout=5)
+                if perpetual_agent_thread.is_alive():
+                    logger.warning("Perpetual agent thread did not stop within timeout - forcing shutdown")
+                    # Force stop the agent
+                    perpetual_agent_instance.running = False
+                    # Give it one more second
+                    perpetual_agent_thread.join(timeout=1)
+                    if perpetual_agent_thread.is_alive():
+                        logger.warning("Perpetual agent thread still alive - continuing shutdown anyway")
+                    else:
+                        logger.info("Perpetual agent thread stopped after force shutdown")
+                else:
+                    logger.info("Perpetual agent thread stopped successfully")
     except Exception as e:
         logger.error(f"Error stopping perpetual agent: {e}")
     
