@@ -13,7 +13,15 @@ import sqlite3
 import hashlib
 import threading
 import logging
+import asyncio
 import agent  # Import our agent module for advanced functionality
+from datetime import datetime
+import signal
+# Create a thread pool executor for blocking operations
+import concurrent.futures
+import atexit
+import os
+import threading
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -46,6 +54,16 @@ SEEDLIST = [
 ]
 
 DB_PATH = 'users.db'
+
+# Global variable to track the perpetual agent
+perpetual_agent_instance = None
+perpetual_agent_thread = None
+
+# Create daemon thread pool executor to ensure threads don't prevent exit
+thread_pool_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix="osint_worker"
+)
 
 
 def init_db():
@@ -150,14 +168,37 @@ async def logout(request: Request):
 async def get_circuit_breaker_status(user=Depends(get_current_user)):
     """Get the status of all search engine circuit breakers."""
     try:
-        status = agent.get_circuit_breaker_status()
+        status = await asyncio.get_event_loop().run_in_executor(
+            thread_pool_executor, 
+            agent.get_circuit_breaker_status
+        )
         return {'success': True, 'circuit_breakers': status}
     except Exception as e:
         return JSONResponse({'success': False, 'error': str(e)}, status_code=500)
 
-# Global variable to track the perpetual agent
-perpetual_agent_instance = None
-perpetual_agent_thread = None
+# Register cleanup function to run on exit
+def cleanup_on_exit():
+    """Cleanup when process exits."""
+    try:
+        logger.info("Cleanup on exit...")
+        
+        # Shutdown thread pool gracefully
+        thread_pool_executor.shutdown(wait=False)
+        
+        # Log any remaining threads for debugging
+        import threading
+        remaining_threads = [t for t in threading.enumerate() if t != threading.main_thread()]
+        if remaining_threads:
+            logger.info(f"Remaining threads on exit: {[t.name for t in remaining_threads]}")
+            
+    except Exception as e:
+        logger.error(f"Error in cleanup: {e}")
+
+atexit.register(cleanup_on_exit)
+
+# Note: Let uvicorn handle signals gracefully
+# Custom signal handlers can interfere with uvicorn's shutdown process
+# and cause issues with proper cleanup
 
 @app.on_event("startup")
 async def startup_event():
@@ -196,15 +237,26 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Stop the perpetual agent when the application shuts down."""
-    global perpetual_agent_instance
+    global perpetual_agent_instance, perpetual_agent_thread, thread_pool_executor
     
+    logger.info("Starting shutdown...")
+    
+    # Quick shutdown - don't wait for anything
     try:
         if perpetual_agent_instance and perpetual_agent_instance.running:
-            logger.info("Stopping perpetual agent on application shutdown...")
+            logger.info("Stopping perpetual agent...")
             perpetual_agent_instance.stop()
-            logger.info("Perpetual agent stopped successfully")
     except Exception as e:
-        logger.error(f"Error stopping perpetual agent on shutdown: {e}")
+        logger.error(f"Error stopping perpetual agent: {e}")
+    
+    try:
+        logger.info("Shutting down thread pool...")
+        thread_pool_executor.shutdown(wait=False)
+        logger.info("Thread pool shutdown initiated")
+    except Exception as e:
+        logger.error(f"Error shutting down thread pool: {e}")
+    
+    logger.info("Shutdown completed")
 
 @app.post('/agent/start-perpetual')
 async def start_perpetual_agent(data: dict, user=Depends(get_current_user)):
@@ -279,7 +331,10 @@ async def get_agent_status(user=Depends(get_current_user)):
 async def get_category_stats(user=Depends(get_current_user)):
     """Get statistics about collected intelligence by category."""
     try:
-        counts = agent.get_category_counts()
+        counts = await asyncio.get_event_loop().run_in_executor(
+            thread_pool_executor, 
+            agent.get_category_counts
+        )
         return {'success': True, 'category_counts': counts}
     except Exception as e:
         return JSONResponse({'success': False, 'error': str(e)}, status_code=500)
@@ -288,19 +343,51 @@ async def get_category_stats(user=Depends(get_current_user)):
 async def get_url_stats(user=Depends(get_current_user)):
     """Get statistics about URLs in the database."""
     try:
-        stats = agent.get_url_stats_db()
+        stats = await asyncio.get_event_loop().run_in_executor(
+            thread_pool_executor, 
+            agent.get_url_stats_db
+        )
         return {'success': True, 'url_stats': stats}
     except Exception as e:
         return JSONResponse({'success': False, 'error': str(e)}, status_code=500)
+
+@app.get('/health')
+async def health_check():
+    """Health check endpoint to monitor system status."""
+    try:
+        # Check thread pool status
+        thread_pool_status = {
+            "active_threads": thread_pool_executor._threads,
+            "pending_tasks": thread_pool_executor._work_queue.qsize(),
+            "max_workers": thread_pool_executor._max_workers
+        }
+        
+        # Check perpetual agent status
+        agent_status = None
+        if perpetual_agent_instance:
+            agent_status = perpetual_agent_instance.get_status()
+        
+        return {
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "thread_pool": thread_pool_status,
+            "perpetual_agent": agent_status
+        }
+    except Exception as e:
+        return JSONResponse(
+            {"status": "unhealthy", "error": str(e)}, 
+            status_code=500
+        )
 
 @app.get('/latest-intelligence')
 async def get_latest_intelligence(user=Depends(get_current_user)):
     """Get the latest 10 intelligence links with confidence > 50, ordered by timestamp."""
     try:
         # Get latest intelligence from the condensed pages table
-        latest = agent.retrieve_condensed_pages(
-            intelligence_relevant=1,
-            confidence=50
+        latest = await asyncio.get_event_loop().run_in_executor(
+            thread_pool_executor, 
+            agent.retrieve_condensed_pages, 
+            None, 1, 50, None
         )
         
         latest.sort(
@@ -328,36 +415,59 @@ async def search_endpoint(data: dict, user=Depends(get_current_user)):
         if not query:
             return JSONResponse({'success': False, 'error': 'Query required'}, status_code=400)
         
-        # Call the agent's search function
-        results = agent.search_by_category_and_semantics(query, top_k, sim_threshold)
+        # Run the agent's search function in a thread pool to avoid blocking
+        try:
+            results = await asyncio.get_event_loop().run_in_executor(
+                thread_pool_executor, 
+                agent.search_by_category_and_semantics, 
+                query, top_k, sim_threshold
+            )
+        except asyncio.CancelledError:
+            logger.warning("Search was cancelled during shutdown")
+            return JSONResponse({'success': False, 'error': 'Operation cancelled during shutdown'}, status_code=503)
         
         # If results are insufficient and auto_collect is enabled, auto-fill links
         if len(results) < 5 and auto_collect:
-            def auto_fill_background():
-                try:
-                    logger.info(f"Auto-filling links for query: {query}")
-                    auto_fill_result = agent.auto_fill_links(query, limit=20)
-                    logger.info(f"Auto-fill completed for query: {query} - added {auto_fill_result.get('links_added', 0)} links")
-                except Exception as e:
-                    logger.error(f"Auto-fill failed for query {query}: {e}")
-            
-            # Start auto-fill in background thread
-            auto_fill_thread = threading.Thread(target=auto_fill_background, daemon=True)
-            auto_fill_thread.start()
-            
-            return {
-                'success': True, 
-                'query': query,
-                'results': results, 
-                'count': len(results),
-                'auto_collection_started': True,
-                'message': f'Found {len(results)} results. Started auto-fill for more links.',
-                'parameters': {
-                    'top_k': top_k,
-                    'sim_threshold': sim_threshold,
-                    'auto_collect': auto_collect
+            try:
+                logger.info(f"Auto-filling links for query: {query}")
+                # Run auto-fill in thread pool to avoid blocking
+                auto_fill_result = await asyncio.get_event_loop().run_in_executor(
+                    thread_pool_executor, 
+                    agent.auto_fill_links, 
+                    query, 20
+                )
+                logger.info(f"Auto-fill completed for query: {query} - added {auto_fill_result.get('links_added', 0)} links")
+                
+                return {
+                    'success': True, 
+                    'query': query,
+                    'results': results, 
+                    'count': len(results),
+                    'auto_collection_started': True,
+                    'auto_fill_result': auto_fill_result,
+                    'message': f'Found {len(results)} results. Auto-fill completed and added {auto_fill_result.get("links_added", 0)} links.',
+                    'parameters': {
+                        'top_k': top_k,
+                        'sim_threshold': sim_threshold,
+                        'auto_collect': auto_collect
+                    }
                 }
-            }
+            except Exception as e:
+                logger.error(f"Auto-fill failed for query {query}: {e}")
+                return {
+                    'success': True, 
+                    'query': query,
+                    'results': results, 
+                    'count': len(results),
+                    'auto_collection_started': False,
+                    'auto_fill_error': str(e),
+                    'message': f'Found {len(results)} results. Auto-fill failed: {e}',
+                    'parameters': {
+                        'top_k': top_k,
+                        'sim_threshold': sim_threshold,
+                        'auto_collect': auto_collect
+                    }
+                }
         else:
             return {
                 'success': True, 
@@ -382,11 +492,26 @@ async def run_agent_endpoint(data: dict, user=Depends(get_current_user)):
         n_steps = data.get('n_steps', 10)
         seed_keyword = data.get('seed_keyword', 'security threats')
         
-        # Run the agent
-        agent.run_agent(n_steps=n_steps, seed_keyword=seed_keyword)
+        # Run the agent in a thread pool to avoid blocking
+        await asyncio.get_event_loop().run_in_executor(
+            thread_pool_executor, 
+            agent.run_agent, 
+            n_steps, seed_keyword
+        )
         return {'success': True, 'message': f'Agent completed {n_steps} steps'}
+    except asyncio.CancelledError:
+        logger.warning("Agent run was cancelled during shutdown")
+        return JSONResponse({'success': False, 'error': 'Operation cancelled during shutdown'}, status_code=503)
     except Exception as e:
         return JSONResponse({'success': False, 'error': str(e)}, status_code=500)
 
 if __name__ == '__main__':
-    uvicorn.run("api:app", host='0.0.0.0', port=8000, reload=True, workers = 4)
+    uvicorn.run(
+        "api:app", 
+        host='0.0.0.0', 
+        port=8000,  # Use different port to avoid conflicts
+        reload=False,  # reload=True with multiple workers causes conflicts
+        workers=1,  # Start with 1 worker to eliminate worker conflicts
+        timeout_keep_alive=30,
+        timeout_graceful_shutdown=10  # Shorter timeout for faster shutdown
+    )
