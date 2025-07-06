@@ -389,4 +389,4 @@ async def run_agent_endpoint(data: dict, user=Depends(get_current_user)):
         return JSONResponse({'success': False, 'error': str(e)}, status_code=500)
 
 if __name__ == '__main__':
-    uvicorn.run("api:app", host='0.0.0.0', port=8000, reload=True)
+    uvicorn.run("api:app", host='0.0.0.0', port=8000, reload=True, workers = 4)

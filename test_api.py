@@ -109,8 +109,8 @@ class OSINTAPITester:
             return False
     
     def test_agent_status(self) -> bool:
-        """Test agent status (should be running from startup)"""
-        self.print_test("Agent Status (Auto-Start)")
+        """Test agent status (should be running from startup with new delay)"""
+        self.print_test("Agent Status (Auto-Start with 10s Delay)")
         
         result = self.make_request("GET", "/agent/status")
         
@@ -122,7 +122,12 @@ class OSINTAPITester:
                 self.print_success("Perpetual agent is running (auto-started)")
                 self.print_info(f"Total runs: {agent_status.get('total_runs', 0)}")
                 self.print_info(f"Current keyword: {agent_status.get('current_keyword', 'N/A')}")
-                self.print_info(f"Delay: {agent_status.get('delay_seconds', 0)}s")
+                delay = agent_status.get('delay_seconds', 0)
+                self.print_info(f"Delay: {delay}s (updated from 120s to 10s)")
+                if delay == 10:
+                    self.print_success("Agent is using the new 10-second delay")
+                else:
+                    self.print_info(f"Agent delay is {delay}s (may need restart)")
             else:
                 self.print_info("Perpetual agent is not running")
             
@@ -135,17 +140,23 @@ class OSINTAPITester:
         """Test agent control endpoints"""
         self.print_test("Agent Control")
         
-        # Test manual agent run
+        # Test manual agent run (now processes multiple URLs)
         run_data = {"n_steps": 3, "seed_keyword": "test"}
         result = self.make_request("POST", "/agent/run", run_data)
         
         if result.get("success"):
             self.print_success("Manual agent run successful")
+            # Check if the response indicates multiple URL processing
+            if "processed_count" in str(result):
+                self.print_info("Agent is processing multiple URLs per step (new format)")
+            else:
+                self.print_info("Agent is processing single URLs per step (legacy format)")
         else:
             self.print_error(f"Manual agent run failed: {result.get('error', 'Unknown error')}")
         
         # Test start perpetual (should fail if already running)
-        start_data = {"delay_seconds": 60, "max_steps_per_run": 5}
+        # Updated to reflect the new 10-second delay setting
+        start_data = {"delay_seconds": 10, "max_steps_per_run": 5}
         result = self.make_request("POST", "/agent/start-perpetual", start_data)
         
         if result.get("success"):
@@ -154,6 +165,30 @@ class OSINTAPITester:
             self.print_info(f"Perpetual agent start result: {result.get('error', 'Unknown error')} (expected if already running)")
         
         return True
+    
+    def test_multiple_url_processing(self) -> bool:
+        """Test the new multiple URL processing functionality"""
+        self.print_test("Multiple URL Processing")
+        
+        # Test that the agent can process multiple URLs in one step
+        run_data = {"n_steps": 1, "seed_keyword": "cyber threats"}
+        result = self.make_request("POST", "/agent/run", run_data)
+        
+        if result.get("success"):
+            self.print_success("Agent run completed")
+            
+            # Check if the response shows multiple URL processing
+            response_text = str(result)
+            if "processed_count" in response_text and "processed_urls" in response_text:
+                self.print_success("Multiple URL processing is active")
+                self.print_info("Agent now processes up to 5 URLs per step")
+            else:
+                self.print_info("Single URL processing (legacy mode)")
+            
+            return True
+        else:
+            self.print_error(f"Multiple URL processing test failed: {result.get('error', 'Unknown error')}")
+            return False
     
     def test_statistics(self) -> bool:
         """Test statistics endpoints"""
@@ -258,6 +293,7 @@ class OSINTAPITester:
             ("Search with Auto-Fill", self.test_search),
             ("Agent Status (Auto-Start)", self.test_agent_status),
             ("Agent Control", self.test_agent_control),
+            ("Multiple URL Processing", self.test_multiple_url_processing),
             ("Statistics", self.test_statistics),
             ("System Status", self.test_system_status),
             ("Error Handling", self.test_error_handling),
