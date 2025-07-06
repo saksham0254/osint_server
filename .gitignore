@@ -1,0 +1,5 @@
+.env
+venv/
+users.db
+webpages_state.db
+

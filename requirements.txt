@@ -1,0 +1,13 @@
+requests[socks]
+beautifulsoup4
+faiss-cpu
+numpy
+fastapi
+flask
+flask-cors 
+openai
+pydantic
+onionsearch[socks]
+stem
+uvicorn
+python-dotenv
